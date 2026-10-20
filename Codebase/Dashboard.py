@@ -1,6 +1,6 @@
 """Solar MPPT demonstration dashboard for Controller.ino.
 Install: python -m pip install PySide6 pyserial pyqtgraph
-Run: python solar_dashboard_slider.py
+Run: python Dashboard_slider.py
 """
 import sys
 import time
