@@ -10,4 +10,4 @@ Electronic Programmable Load Simulation
 https://www.circuitlab.com/circuit/7zh994n8n9vx/electronic-programmable-load/
 
 Schematic
-[text](schematic/EE1111A/EE1111A.pdf)
+[Image](schematic/EE1111A/EE1111A.pdf)
