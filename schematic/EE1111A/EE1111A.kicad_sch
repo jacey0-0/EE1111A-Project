@@ -6580,7 +6580,7 @@
 				)
 			)
 		)
-		(property "Value" "33uH"
+		(property "Value" "150uH"
 			(at 177.8 137.16 90)
 			(show_name no)
 			(do_not_autoplace no)
