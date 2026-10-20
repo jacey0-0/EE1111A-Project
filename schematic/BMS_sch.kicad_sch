@@ -2215,7 +2215,7 @@
 				)
 			)
 		)
-		(property "Datasheet" ""
+		(property "Datasheet" "Li-On Battery, 1 Single Cell"
 			(at 97.79 81.026 90)
 			(hide yes)
 			(show_name no)
