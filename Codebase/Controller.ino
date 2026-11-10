@@ -19,16 +19,26 @@ const float OVERVOLT_TRIP=4.19f, OVERCURRENT_TRIP=0.36f;
 const float TERMINATE_BELOW=0.045f;
 const float LOAD_CUTOFF=3.20f, LOAD_RESTART=3.45f;
 const float PV_HEADROOM=0.7f;
-const float SHUNT_OHMS=0.50f, ADC_VREF=5.00f;
+const float SHUNT_OHMS=0.50f;
+const float ADC_VREF=5.00f; // measure the Arduino 5V pin with a multimeter and enter it here
+int adcZero=0;               // ground-wire offset, measured at boot with load off
 const byte MAX_BUCK_DUTY=160;
-const unsigned long SENSOR_PERIOD=100, TRACK_PERIOD=300;
-const unsigned long TELEMETRY_PERIOD=1000, STALE_LIMIT=500;
+const unsigned long SENSOR_PERIOD=100, TRACK_PERIOD=30, LDR_PERIOD=50;
+const unsigned long SERVO_MOVE_MS=50;
+const int MIN_ANGLE=20, MAX_ANGLE=150;
+const int START_THRESHOLD=12, STOP_THRESHOLD=6;
+const float LEFT_ROOM=664.0f, RIGHT_ROOM=497.0f;
+const float LEFT_LAMP=21.0f, RIGHT_LAMP=10.0f;
+const unsigned long TELEMETRY_PERIOD=1000, STALE_LIMIT=2000;
 const unsigned long TERMINATION_HOLD=30000UL;
 const unsigned long CHARGE_TIMEOUT=12UL*3600UL*1000UL;
 
 float pvV=NAN, pvI=NAN, pvP=NAN, batV=NAN, chargeI=NAN, loadI=NAN;
 float targetLoadA=0.0f;
 int leftLDR=0, rightLDR=0, angle=90;
+float leftFiltered=0.0f, rightFiltered=0.0f;
+bool tracking=false;
+unsigned long lastServoMove=0;
 byte buckDuty=0;
 int8_t mpptDirection=1;
 float previousPower=NAN;
@@ -44,21 +54,21 @@ const float CC_HYSTERESIS=0.025f;
 const float CV_HYSTERESIS=0.015f;
 bool chargeEnabled=false, loadEnabled=false, trackEnabled=true;
 bool fault=false, full=false, loadLocked=false;
-unsigned long lastGood=0, lastSense=0, lastTrack=0, lastReport=0;
+unsigned long lastGood=0, lastSense=0, lastTrack=0, lastReport=0, lastLDR=0;
 unsigned long cvLowCurrentSince=0, chargeTime=0, lastChargeTick=0;
 unsigned long servoFrame=0, servoStart=0;
 bool servoHigh=false;
 const char* mode="OFF";
 
 void setupPWM() {
-  digitalWrite(BUCK_PIN,HIGH); pinMode(BUCK_PIN,OUTPUT);
+  digitalWrite(BUCK_PIN,LOW); pinMode(BUCK_PIN,OUTPUT);
   digitalWrite(LOAD_PIN,LOW); pinMode(LOAD_PIN,OUTPUT);
   TCCR1A=_BV(WGM10); TCCR1B=_BV(CS10);
   OCR1A=0; OCR1B=0;
 }
 void buckOff() {
   TCCR1A &= (byte)~(_BV(COM1A1)|_BV(COM1A0));
-  digitalWrite(BUCK_PIN,HIGH);
+  digitalWrite(BUCK_PIN,LOW);
   buckDuty=0;
   previousPower=NAN;
   mpptDirection=1;
@@ -69,7 +79,7 @@ void setBuck(byte onDuty) {
   buckDuty=min(onDuty,MAX_BUCK_DUTY);
   OCR1A=buckDuty;
   TCCR1A=(TCCR1A & (byte)~(_BV(COM1A1)|_BV(COM1A0)))
-         | _BV(COM1A1) | _BV(COM1A0); 
+         | _BV(COM1A1); // 
 }
 void stepBuck(int step) {
   setBuck((byte)constrain((int)buckDuty+step,0,(int)MAX_BUCK_DUTY));
@@ -108,13 +118,27 @@ void servoPulse() {
 }
 bool quietWindow() {
   unsigned long elapsed=micros()-servoFrame;
-  return !servoHigh && elapsed>=2500UL && elapsed<13000UL;
+  return !servoHigh && elapsed>=2500UL && elapsed<11000UL;
 }
-void trackSun() {
-  if (!trackEnabled) return;
-  int difference=leftLDR-rightLDR;
-  if (abs(difference)>35)
-    angle=constrain(angle+(difference>0?1:-1),15,165);
+float correctedRight(float right) {
+  float rightRange=RIGHT_LAMP-RIGHT_ROOM;
+  if (fabs(rightRange)<1.0f) return right;
+  float gain=(LEFT_LAMP-LEFT_ROOM)/rightRange;
+  return LEFT_ROOM+(right-RIGHT_ROOM)*gain;
+}
+void trackSun(unsigned long now) {
+  if (!trackEnabled || fault) { tracking=false; return; }
+  int difference=(int)round(leftFiltered-correctedRight(rightFiltered));
+  int error=abs(difference);
+  if (!tracking && error>START_THRESHOLD) tracking=true;
+  if (tracking && error<STOP_THRESHOLD) tracking=false;
+  if (!tracking || now-lastServoMove<SERVO_MOVE_MS) return;
+  lastServoMove=now;
+  int stepSize=(error>150)?8:((error>50)?5:2);
+  int direction=(difference>0)?1:-1;
+  int newAngle=constrain(angle+direction*stepSize,MIN_ANGLE,MAX_ANGLE);
+  if (newAngle!=angle) angle=newAngle;
+  else tracking=false;
 }
 
 int readAverageADC(byte pin) {
@@ -130,13 +154,19 @@ bool readSensors() {
   float bShunt=battery.getShuntVoltage_mV();
   float bV=battery.getBusVoltage_V()+bShunt/1000.0f;
   float bI=-bShunt/100.0f; 
-  float lI=(readAverageADC(SHUNT_PIN)*ADC_VREF/1023.0f)/SHUNT_OHMS;
+  int rawLoad=readAverageADC(SHUNT_PIN)-adcZero;
+  if (rawLoad<0) rawLoad=0;
+  float lI=(rawLoad*ADC_VREF/1023.0f)/SHUNT_OHMS;
   if (!isfinite(pV)||!isfinite(pI)||!isfinite(bV)||!isfinite(bI)||!isfinite(lI)) return false;
   if (pV<0||pV>26||pI< -0.05f||pI>2.0f ||
       bV<2.0f||bV>4.6f||fabs(bI)>2.0f||lI<0||lI>1.5f) return false;
   pvV=pV; pvI=pI; pvP=pV*pI; batV=bV; chargeI=bI; loadI=lI;
-  leftLDR=readAverageADC(LDR_L); rightLDR=readAverageADC(LDR_R);
   return true;
+}
+void sampleLDR() {
+  leftLDR=readAverageADC(LDR_L); rightLDR=readAverageADC(LDR_R);
+  leftFiltered=0.75f*leftFiltered+0.25f*leftLDR;
+  rightFiltered=0.75f*rightFiltered+0.25f*rightLDR;
 }
 
 void overcurrentEvent(unsigned long now) {
@@ -239,21 +269,21 @@ void command(char* line) {
       Serial.println(F("# LOAD requires 0..500 mA")); return;
     }
     targetLoadA=mA/1000.0f;
-    if (!fault && !loadLocked) loadEnabled=(mA>0);
+    if (!fault) loadEnabled=(mA>0);
   }
   else if (!strcmp(line,"CHARGE ON")) {
     if (!fault && !full) chargeEnabled=true;
   }
   else if (!strcmp(line,"CHARGE OFF")) { chargeEnabled=false; buckOff(); }
-  else if (!strcmp(line,"TRACK ON")) trackEnabled=true;
-  else if (!strcmp(line,"TRACK OFF")) trackEnabled=false;
+  else if (!strcmp(line,"TRACK ON")) { trackEnabled=true; tracking=false; }
+  else if (!strcmp(line,"TRACK OFF")) { trackEnabled=false; tracking=false; }
   else if (!strncmp(line,"ANGLE ",6)) {
     float requested;
-    if (!parseNumber(line+6,requested,15.0f,165.0f) ||
+    if (!parseNumber(line+6,requested,20.0f,150.0f) ||
         requested!=(int)requested) {
-      Serial.println(F("# ANGLE requires integer 15..165")); return;
+      Serial.println(F("# ANGLE requires integer 20..150")); return;
     }
-    angle=(int)requested;
+    angle=(int)requested; tracking=false;
   }
   else if (!strcmp(line,"RESETFAULT")) {
     if (readSensors() && batV>LOAD_CUTOFF && batV<CV_TARGET &&
@@ -303,12 +333,18 @@ void setup() {
 #ifdef WIRE_HAS_TIMEOUT
   Wire.setWireTimeout(3000,true);
 #endif
+  delay(50);
+  { long z=0; for (byte i=0;i<8;i++) { z+=readAverageADC(SHUNT_PIN); delay(5); } adcZero=(int)(z/8); }
+  leftLDR=readAverageADC(LDR_L); rightLDR=readAverageADC(LDR_R);
+  leftFiltered=leftLDR; rightFiltered=rightLDR;
   bool ok1=pv.begin(), ok2=battery.begin();
   if (ok1) pv.setCalibration_32V_2A();
   if (ok2) battery.setCalibration_32V_2A();
   if (!ok1||!ok2) shutdown(F("INA219 missing"));
   else if (!readSensors()) shutdown(F("initial sensor reading invalid"));
-  else lastGood=millis();
+  else {
+    lastGood=millis();
+  }
   lastChargeTick=millis(); servoFrame=micros();
   Serial.println(F("ms,pvV,pvA,pvW,batV,chargeA,loadA,targetA,buckDuty,servo,mode,fault"));
   Serial.println(F("# charge OFF at startup; use CHARGE ON to enable"));
@@ -324,14 +360,15 @@ void loop() {
     lastSense=now;
     if (!readSensors()) {
       buckOff(); setLoad(0); mode="SENSOR_WAIT";
-      if (++badReadings>=3) shutdown(F("three invalid sensor readings"));
+      if (++badReadings>=10) shutdown(F("ten invalid sensor readings"));
     } else {
       badReadings=0; lastGood=millis();
       if (!overcurrentRetryAt) controlLoad();
       controlCharger(millis());
     }
   }
-  if (now-lastTrack>=TRACK_PERIOD) { lastTrack=now; trackSun(); }
+  if (!fault && now-lastLDR>=LDR_PERIOD && quietWindow()) { lastLDR=now; sampleLDR(); }
+  if (now-lastTrack>=TRACK_PERIOD) { lastTrack=now; trackSun(now); }
   if (now-lastReport>=TELEMETRY_PERIOD && quietWindow()) {
     lastReport=now; report();
   }
