@@ -11,7 +11,7 @@ try:
     from serial.tools import list_ports
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-        QHBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox, QSpinBox,
+        QHBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
         QGroupBox, QPlainTextEdit, QMessageBox, QFrame, QSlider, QScrollArea, QSizePolicy)
     import pyqtgraph as pg
 except ImportError as exc:
@@ -92,7 +92,7 @@ class Dashboard(QMainWindow):
         self.values = {}
         items = [("PV POWER", "pvW", "W"), ("PV VOLTAGE", "pvV", "V"),
                  ("PV CURRENT", "pvA", "A"), ("BATTERY VOLTAGE", "batV", "V"),
-                 ("BATTERY CURRENT", "chargeA", "A"), ("LOAD CURRENT", "loadA", "A")]
+                 ("BATTERY CURRENT", "chargeA", "A"), ("LOAD CURRENT", "targetA", "A")]
         for i, (heading, key, unit) in enumerate(items):
             card = QFrame()
             card.setStyleSheet("QFrame {background: #1b2940; border: 1px solid #2b3a51; border-radius: 10px;}")
@@ -106,6 +106,25 @@ class Dashboard(QMainWindow):
             self.values[key] = (v, unit)
             stats.addWidget(card, i // 3, i % 3)
         outer.addLayout(stats)
+        efficiency_row = QHBoxLayout()
+        self.model_eff_label = QLabel("— %")
+        self.model_eff_label.setStyleSheet("font-size: 23px; font-weight: 700; color: #f5c35c;")
+        self.model_eff_note = QLabel("Efficiency")
+        self.model_eff_note.setStyleSheet("color: #9fb1cb; font-size: 11px; font-weight: 700;")
+        model_box = QGroupBox("MPPT")
+        model_lay = QVBoxLayout(model_box)
+        model_lay.addWidget(self.model_eff_note)
+        model_lay.addWidget(self.model_eff_label)
+        efficiency_row.addWidget(model_box, 1)
+        measured_box = QGroupBox("MEASURED POWER RATIO")
+        measured_lay = QVBoxLayout(measured_box)
+        measured_lay.addWidget(QLabel("PV → battery (load OFF only)"))
+        self.measured_ratio_label = QLabel("—")
+        self.measured_ratio_label.setStyleSheet("font-size: 23px; font-weight: 700;")
+        measured_lay.addWidget(self.measured_ratio_label)
+        efficiency_row.addWidget(measured_box, 1)
+        outer.addLayout(efficiency_row)
+
 
         middle = QHBoxLayout()
         left_panel = QWidget()
@@ -127,7 +146,6 @@ class Dashboard(QMainWindow):
         cg.addWidget(self.charge_on, 4, 0)
         cg.addWidget(self.charge_off, 4, 1)
         cg.addWidget(self.action_button("RESET FAULT", "RESETFAULT"), 5, 0)
-        cg.addWidget(self.action_button("REARM FULL", "REARM"), 5, 1)
         left.addWidget(charger)
 
         load = QGroupBox("ELECTRONIC LOAD")
@@ -140,7 +158,6 @@ class Dashboard(QMainWindow):
         lg.addWidget(QLabel("Requested current"), 0, 0)
         lg.addWidget(self.load_value_label, 0, 1, alignment=Qt.AlignmentFlag.AlignRight)
         self.load_slider = QSlider(Qt.Orientation.Horizontal)
-        # 51 slider positions: 0, 10, 20, ... 500 mA.
         self.load_slider.setRange(0, 50)
         self.load_slider.setSingleStep(1)
         self.load_slider.setPageStep(5)
@@ -162,21 +179,13 @@ class Dashboard(QMainWindow):
         left.addWidget(load)
 
         tracking = QGroupBox("SOLAR TRACKER")
-        tracking.setMinimumHeight(180)
+        tracking.setMinimumHeight(125)
         tg = QGridLayout(tracking)
         tg.setVerticalSpacing(9)
-        self.angle_spin = QSpinBox()
-        self.angle_spin.setRange(15, 165)
-        self.angle_spin.setValue(90)
-        self.angle_spin.setSuffix("°")
         self.angle_label = QLabel("Current servo: —")
         tg.addWidget(self.angle_label, 0, 0, 1, 2)
         tg.addWidget(self.action_button("TRACK ON", "TRACK ON", "primary"), 1, 0)
         tg.addWidget(self.action_button("TRACK OFF", "TRACK OFF"), 1, 1)
-        tg.addWidget(self.angle_spin, 2, 0)
-        angle_btn = QPushButton("SET ANGLE")
-        angle_btn.clicked.connect(lambda: self.send(f"ANGLE {self.angle_spin.value()}"))
-        tg.addWidget(angle_btn, 2, 1)
         left.addWidget(tracking)
         left.addStretch()
         scroll = QScrollArea()
@@ -192,16 +201,25 @@ class Dashboard(QMainWindow):
         pg.setConfigOption("foreground", "#aabbd0")
         self.power_plot = pg.PlotWidget(title="Solar Power (W)")
         self.power_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.power_plot.setMouseEnabled(x=False, y=False)
+        self.power_plot.hideButtons()
+        self.power_plot.setMenuEnabled(False)
         self.power_plot.setLabel("bottom", "Elapsed time", "s")
         self.power_curve = self.power_plot.plot(pen=pg.mkPen("#f5c35c", width=2))
         self.power_plot.setMinimumHeight(190)
         right.addWidget(self.power_plot)
         self.current_plot = pg.PlotWidget(title="Battery and Load Current (A)")
         self.current_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.current_plot.setMouseEnabled(x=False, y=False)
+        self.current_plot.hideButtons()
+        self.current_plot.setMenuEnabled(False)
         self.current_plot.setLabel("bottom", "Elapsed time", "s")
-        self.current_plot.addLegend()
-        self.battery_curve = self.current_plot.plot(pen=pg.mkPen("#4fd1a5", width=2), name="Battery (+ charge / − discharge)")
-        self.load_curve = self.current_plot.plot(pen=pg.mkPen("#7caef6", width=2), name="Load")
+        self.current_plot.addLegend(offset=(-10, -10))
+        self.battery_curve = self.current_plot.plot(
+            pen=pg.mkPen("#4fd1a5", width=2),
+            name="Battery (+ charge / − discharge)")
+        self.load_curve = self.current_plot.plot(
+            pen=pg.mkPen("#7caef6", width=2), name="Load target")
         self.current_plot.setMinimumHeight(190)
         right.addWidget(self.current_plot)
         middle.addLayout(right, 2)
@@ -215,7 +233,7 @@ class Dashboard(QMainWindow):
         self.log.setFixedHeight(95)
         log_layout.addWidget(self.log)
         outer.addWidget(log_group)
-        self.controls = [self.charge_on, self.charge_off, apply_btn, angle_btn]
+        self.controls = [self.charge_on, self.charge_off, apply_btn]
         self.controls += [w for w in root.findChildren(QPushButton) if w not in self.controls and w not in (self.connect_btn, self.refresh)]
         self.set_controls(False)
 
@@ -230,7 +248,6 @@ class Dashboard(QMainWindow):
         for button in self.controls:
             button.setEnabled(enabled)
         self.load_slider.setEnabled(enabled)
-        self.angle_spin.setEnabled(enabled)
 
     def refresh_ports(self):
         current = self.port.currentData()
@@ -253,6 +270,8 @@ class Dashboard(QMainWindow):
         try:
             self.ser = serial.Serial(port, 115200, timeout=0, write_timeout=0.2)
             self.buffer.clear()
+            self.model_eff_label.setText("— %")
+            self.measured_ratio_label.setText("—")
             self.last_packet = 0
             self.times.clear(); self.powers.clear(); self.currents.clear(); self.loads.clear()
             self.connection.setText(f"● Connected: {port} (waiting for telemetry)")
@@ -278,6 +297,8 @@ class Dashboard(QMainWindow):
         self.connect_btn.setText("Connect")
         self.port.setEnabled(True)
         self.set_controls(False)
+        self.model_eff_label.setText("— %")
+        self.measured_ratio_label.setText("—")
 
     def send(self, cmd):
         if not self.ser:
@@ -296,7 +317,6 @@ class Dashboard(QMainWindow):
         if not self.ser:
             return
         try:
-            # Limit work per GUI tick. Keep incomplete lines for the next poll.
             incoming = self.ser.read(min(self.ser.in_waiting, 4096))
             if incoming:
                 self.buffer.extend(incoming)
@@ -341,6 +361,25 @@ class Dashboard(QMainWindow):
         self.connection.setStyleSheet("color: #4fd1a5; font-weight: 700;")
         for key, (label, unit) in self.values.items():
             label.setText(f"{data[key]:.3f} {unit}")
+        import math
+        pv_power = data["pvW"]
+        bat_power = data["batV"] * data["chargeA"]
+        valid_ratio = (math.isfinite(pv_power) and math.isfinite(bat_power)
+                       and pv_power > 0.02 and data["targetA"] <= 0.001
+                       and bat_power > 0)
+        if valid_ratio:
+            ratio = 100.0 * bat_power / pv_power
+            self.model_eff_label.setText(f"{ratio:.1f}%")
+        else:
+            self.model_eff_label.setText("— %")
+        pv_power = data["pvW"]
+        bat_power = data["batV"] * data["chargeA"]
+        if (math.isfinite(pv_power) and math.isfinite(bat_power)
+                and pv_power > 0.02 and data["targetA"] <= 0.001
+                and bat_power > 0):
+            self.measured_ratio_label.setText(f"{100 * bat_power / pv_power:.1f}%")
+        else:
+            self.measured_ratio_label.setText("—")
         self.mode_label.setText("Mode: " + data["mode"])
         self.fault_label.setText("Fault: " + ("LATCHED — inspect system" if data["fault"] else "None"))
         self.fault_label.setStyleSheet("color: #f49c9c;" if data["fault"] else "color: #4fd1a5;")
@@ -353,10 +392,12 @@ class Dashboard(QMainWindow):
         self.times.append(data["ms"] / 1000.0)
         self.powers.append(data["pvW"])
         self.currents.append(current)
-        self.loads.append(data["loadA"])
+        self.loads.append(data["targetA"])
         self.power_curve.setData(list(self.times), list(self.powers))
         self.battery_curve.setData(list(self.times), list(self.currents))
         self.load_curve.setData(list(self.times), list(self.loads))
+        self.power_plot.getPlotItem().autoRange(padding=0.08)
+        self.current_plot.getPlotItem().autoRange(padding=0.08)
 
     def closeEvent(self, event):
         self.disconnect()
