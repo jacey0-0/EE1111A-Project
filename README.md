@@ -412,10 +412,11 @@ python Dashboard_Autoscale_Legend.py
 ```
 
 ## 11. Known limitations and further work
+1. **MPPT Convergence:** Improve the existing P&O algorithm by replacing the two-drop reversal heuristic with a rolling power baseline or bounded duty-cycle sweep to improve convergence and prevent the controller from drifting away from the maximum power point. Alternatively, explore FPGA-based MPPT control for faster sampling, parallel processing and implementation of more advanced tracking algorithms.
 
-1. **Charging safety:** Replace experimental open-loop / software-only protection assumptions with a verified dedicated single-cell CC/CV charging stage and independent protection. Verify battery temperature, voltage, current, MOSFET OFF state and fault response before unattended operation.
-2. **MPPT convergence:** Replace the two-drop heuristic with a rolling baseline or bounded sweep/reacquisition strategy; benchmark against a measured PV I–V/P–V curve under constant illumination.
-3. **Load measurement:** Add differential/Kelvin shunt sensing or a calibrated amplifier.
+2. **Load Current Measurement:** Improve measurement accuracy by incorporating Kelvin shunt sensing and a calibrated differential amplifier. This would amplify the small voltage across the 0.5 Ω shunt, improving the Arduino's limited ADC resolution while reducing errors caused by ground resistance and measurement offsets.
+
+3. **Higher-Power PV Testing:** Extend testing beyond the current 12 V, 5 W solar panel under indoor solar-lamp conditions, where power generation was significantly below its rated capacity. A higher-wattage PV panel or stronger, controlled illumination would allow further evaluation of MPPT performance, buck converter efficiency and battery charging at higher power levels. This would also enable validation of component thermal performance, current-handling capability and the transition between DCM and CCM.
 
 ## 12. Schematics and simulations
 
