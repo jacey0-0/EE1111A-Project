@@ -2,6 +2,7 @@
 #include <Adafruit_INA219.h>
 #include <avr/wdt.h>
 #include <avr/io.h>
+#include <avr/interrupt.h>
 
 void earlyWatchdogOff(void) __attribute__((naked, section(".init3")));
 void earlyWatchdogOff(void) { MCUSR=0; wdt_disable(); }
@@ -20,18 +21,19 @@ const float TERMINATE_BELOW=0.045f;
 const float LOAD_CUTOFF=3.20f, LOAD_RESTART=3.45f;
 const float PV_HEADROOM=0.7f;
 const float SHUNT_OHMS=0.50f;
-const float ADC_VREF=5.00f; // measure the Arduino 5V pin with a multimeter and enter it here
-int adcZero=0;               // ground-wire offset, measured at boot with load off
+const float ADC_VREF=4.85f; 
+int adcZero=0;            
 const byte MAX_BUCK_DUTY=160;
-const unsigned long SENSOR_PERIOD=100, TRACK_PERIOD=30, LDR_PERIOD=50;
+const unsigned long SENSOR_PERIOD=100, TRACK_PERIOD=30, LDR_PERIOD=30;
 const unsigned long SERVO_MOVE_MS=50;
-const int MIN_ANGLE=20, MAX_ANGLE=150;
+const int MIN_ANGLE=10, MAX_ANGLE=170;
 const int START_THRESHOLD=12, STOP_THRESHOLD=6;
 const float LEFT_ROOM=664.0f, RIGHT_ROOM=497.0f;
 const float LEFT_LAMP=21.0f, RIGHT_LAMP=10.0f;
 const unsigned long TELEMETRY_PERIOD=1000, STALE_LIMIT=2000;
 const unsigned long TERMINATION_HOLD=30000UL;
 const unsigned long CHARGE_TIMEOUT=12UL*3600UL*1000UL;
+const float BATTERY_CURRENT_OFFSET = 0.004f;
 
 float pvV=NAN, pvI=NAN, pvP=NAN, batV=NAN, chargeI=NAN, loadI=NAN;
 float targetLoadA=0.0f;
@@ -42,9 +44,15 @@ unsigned long lastServoMove=0;
 byte buckDuty=0;
 int8_t mpptDirection=1;
 float previousPower=NAN;
+float mpptPowerSum=0.0f;
+byte mpptPowerSamples=0;
+bool mpptDebug=true;
 
-const byte MPPT_SETTLE_TICKS=5;
+const byte MPPT_SETTLE_TICKS=10;
+const float MPPT_MIN_DEADBAND_W=0.010f;
+const float MPPT_REL_DEADBAND=0.02f;
 byte mpptWait=0;
+byte mpptDropCount=0;
 byte badReadings=0;
 unsigned long overcurrentRetryAt=0;
 unsigned long tripTimes[3]={0,0,0};
@@ -56,8 +64,52 @@ bool chargeEnabled=false, loadEnabled=false, trackEnabled=true;
 bool fault=false, full=false, loadLocked=false;
 unsigned long lastGood=0, lastSense=0, lastTrack=0, lastReport=0, lastLDR=0;
 unsigned long cvLowCurrentSince=0, chargeTime=0, lastChargeTick=0;
-unsigned long servoFrame=0, servoStart=0;
-bool servoHigh=false;
+volatile uint16_t servoPulseTicks=375; // 1500 us at startup
+volatile uint16_t servoRemainingTicks=0;
+volatile uint8_t servoChunkTicks=250;
+volatile bool servoOutputHigh=false;
+
+void setupServoTimer2() {
+  pinMode(SERVO_PIN, OUTPUT);
+  digitalWrite(SERVO_PIN, LOW);
+  noInterrupts();
+  TCCR2A=_BV(WGM21);  // CTC; disconnect Timer2 PWM outputs
+  TCCR2B=_BV(CS22);   // prescaler 64 (4 us/tick)
+  TCNT2=0;
+  OCR2A=249;         // first interrupt in 1000 us
+  TIFR2=_BV(OCF2A);
+  TIMSK2=_BV(OCIE2A);
+  interrupts();
+}
+
+void updateServoTarget() {
+  uint16_t ticks=(uint16_t)map(angle,0,180,250,500); 
+  noInterrupts();
+  servoPulseTicks=ticks;
+  interrupts();
+}
+
+ISR(TIMER2_COMPA_vect) {
+  if (servoRemainingTicks >= servoChunkTicks)
+    servoRemainingTicks -= servoChunkTicks;
+  else
+    servoRemainingTicks=0;
+
+  if (servoRemainingTicks == 0) {
+    if (servoOutputHigh) {
+      PORTB &= (uint8_t)~_BV(PB3); // D11 LOW
+      servoOutputHigh=false;
+      servoRemainingTicks=5000-servoPulseTicks; 
+    } else {
+      PORTB |= _BV(PB3);           // D11 HIGH
+      servoOutputHigh=true;
+      servoRemainingTicks=servoPulseTicks;
+    }
+  }
+  servoChunkTicks=(servoRemainingTicks>250)?250:(uint8_t)servoRemainingTicks;
+  TCNT2=0;
+  OCR2A=servoChunkTicks-1;
+}
 const char* mode="OFF";
 
 void setupPWM() {
@@ -73,6 +125,8 @@ void buckOff() {
   previousPower=NAN;
   mpptDirection=1;
   mpptWait=0;
+  mpptDropCount=0;
+  mpptPowerSum=0.0f; mpptPowerSamples=0;
 }
 void setBuck(byte onDuty) {
   if (!onDuty) { buckOff(); return; }
@@ -101,25 +155,10 @@ void setLoad(float amps) {
 }
 void shutdown(const __FlashStringHelper* reason) {
   buckOff(); setLoad(0); chargeEnabled=false; loadEnabled=false;
-  fault=true; mode="FAULT";
+  targetLoadA=0.0f; fault=true; mode="FAULT";
   Serial.print(F("# FAULT: ")); Serial.println(reason);
 }
 
-void servoPulse() {
-  unsigned long now=micros();
-  if (servoHigh) {
-    if (now-servoStart >= (unsigned long)map(angle,0,180,1000,2000)) {
-      digitalWrite(SERVO_PIN,LOW); servoHigh=false;
-    }
-  } else if (now-servoFrame>=20000UL) {
-    servoFrame=now; servoStart=now;
-    digitalWrite(SERVO_PIN,HIGH); servoHigh=true;
-  }
-}
-bool quietWindow() {
-  unsigned long elapsed=micros()-servoFrame;
-  return !servoHigh && elapsed>=2500UL && elapsed<11000UL;
-}
 float correctedRight(float right) {
   float rightRange=RIGHT_LAMP-RIGHT_ROOM;
   if (fabs(rightRange)<1.0f) return right;
@@ -137,7 +176,7 @@ void trackSun(unsigned long now) {
   int stepSize=(error>150)?8:((error>50)?5:2);
   int direction=(difference>0)?1:-1;
   int newAngle=constrain(angle+direction*stepSize,MIN_ANGLE,MAX_ANGLE);
-  if (newAngle!=angle) angle=newAngle;
+  if (newAngle!=angle) { angle=newAngle; updateServoTarget(); }
   else tracking=false;
 }
 
@@ -153,7 +192,7 @@ bool readSensors() {
   float pI=pShunt/100.0f; 
   float bShunt=battery.getShuntVoltage_mV();
   float bV=battery.getBusVoltage_V()+bShunt/1000.0f;
-  float bI=-bShunt/100.0f; 
+  float bI = -bShunt / 100.0f + BATTERY_CURRENT_OFFSET;
   int rawLoad=readAverageADC(SHUNT_PIN)-adcZero;
   if (rawLoad<0) rawLoad=0;
   float lI=(rawLoad*ADC_VREF/1023.0f)/SHUNT_OHMS;
@@ -165,8 +204,8 @@ bool readSensors() {
 }
 void sampleLDR() {
   leftLDR=readAverageADC(LDR_L); rightLDR=readAverageADC(LDR_R);
-  leftFiltered=0.75f*leftFiltered+0.25f*leftLDR;
-  rightFiltered=0.75f*rightFiltered+0.25f*rightLDR;
+  leftFiltered=0.6f*leftFiltered+0.4f*leftLDR;
+  rightFiltered=0.6f*rightFiltered+0.4f*rightLDR;
 }
 
 void overcurrentEvent(unsigned long now) {
@@ -214,7 +253,7 @@ void controlCharger(unsigned long now) {
   }
 
   if (batV>=CV_TARGET-0.02f) {
-    mode="CV"; previousPower=NAN; mpptDirection=1; mpptWait=0;
+    mode="CV"; previousPower=NAN; mpptDirection=1; mpptWait=0; mpptDropCount=0; mpptPowerSum=0.0f; mpptPowerSamples=0;
     if (chargeI>currentLimit || batV>=CV_TARGET) stepBuck(-1);
     else if (batV<CV_TARGET-CV_HYSTERESIS &&
              chargeI<currentLimit-CC_HYSTERESIS) stepBuck(+1);
@@ -229,7 +268,7 @@ void controlCharger(unsigned long now) {
   }
   cvLowCurrentSince=0;
   if (chargeI>=currentLimit-CC_HYSTERESIS) {
-    mode="CC_LIMIT"; previousPower=NAN; mpptDirection=1; mpptWait=0;
+    mode="CC_LIMIT"; previousPower=NAN; mpptDirection=1; mpptWait=0; mpptDropCount=0; mpptPowerSum=0.0f; mpptPowerSamples=0;
     if (chargeI>=currentLimit) stepBuck(-1);
     return;
   }
@@ -237,19 +276,69 @@ void controlCharger(unsigned long now) {
   if (!buckDuty) {
     mpptDirection=1;
     previousPower=NAN;
+    mpptPowerSum=0.0f; mpptPowerSamples=0; mpptWait=0; mpptDropCount=0;
     stepBuck(+1);
     return;
   }
-  if (++mpptWait<MPPT_SETTLE_TICKS) return;
+  // Average the five fresh INA219 power samples at each fixed duty.
+  mpptPowerSum += pvP;
+  ++mpptPowerSamples;
+  if (++mpptWait < MPPT_SETTLE_TICKS) return;
   mpptWait=0;
+  float avgPower=mpptPowerSum/mpptPowerSamples;
+  mpptPowerSum=0.0f;
+  mpptPowerSamples=0;
   if (!isfinite(previousPower)) {
-    previousPower=pvP;
+    previousPower=avgPower;
+    byte oldDuty=buckDuty;
     stepBuck(mpptDirection);
+    if (mpptDebug) {
+      Serial.print(F("# MPPT INIT avgP=")); Serial.print(avgPower,4);
+      Serial.print(F(" duty=")); Serial.print(oldDuty);
+      Serial.print(F("->")); Serial.println(buckDuty);
+    }
     return;
   }
-  if (pvP<previousPower-0.010f) mpptDirection=-mpptDirection;
-  previousPower=pvP;
+  float oldPower=previousPower;
+  float deltaP=avgPower-oldPower;
+  float deadband=max(MPPT_MIN_DEADBAND_W, MPPT_REL_DEADBAND*oldPower);
+  // Require two consecutive significant decreases before reversing.
+  if (deltaP < -deadband) {
+    if (mpptDropCount < 2) ++mpptDropCount;
+  } else if (deltaP > deadband) {
+    mpptDropCount=0;
+  }
+  bool reversed=(mpptDropCount>=2);
+  if (reversed) {
+    mpptDirection=-mpptDirection;
+    mpptDropCount=0;
+  }
+  // Reverse at the PWM limits rather than repeatedly requesting an
+  if (buckDuty>=MAX_BUCK_DUTY && mpptDirection>0) {
+    mpptDirection=-1;
+    mpptDropCount=0;
+  }
+  if (buckDuty<=1 && mpptDirection<0) {
+    mpptDirection=1;
+    mpptDropCount=0;
+  }
+  previousPower=avgPower;
+  byte oldDuty=buckDuty;
   stepBuck(mpptDirection);
+  if (mpptDebug) {
+    Serial.print(F("# MPPT avgP=")); Serial.print(avgPower,4);
+    Serial.print(F(" prevP=")); Serial.print(oldPower,4);
+    Serial.print(F(" dP=")); Serial.print(deltaP,4);
+    Serial.print(F(" band=")); Serial.print(deadband,4);
+    Serial.print(F(" V=")); Serial.print(pvV,3);
+    Serial.print(F(" I=")); Serial.print(pvI*1000.0f,1);
+    Serial.print(F("mA dir=")); Serial.print(mpptDirection>0?F("UP"):F("DOWN"));
+    Serial.print(F(" reverse=")); Serial.print(reversed?1:0);
+    Serial.print(F(" drops=")); Serial.print(mpptDropCount);
+    Serial.print(F(" duty=")); Serial.print(oldDuty);
+    Serial.print(F("->")); Serial.print(buckDuty);
+    Serial.print(F(" batI=")); Serial.println(chargeI*1000.0f,1);
+  }
 }
 
 bool parseNumber(const char* text, float &value, float minimum, float maximum) {
@@ -262,7 +351,7 @@ bool parseNumber(const char* text, float &value, float minimum, float maximum) {
 }
 void command(char* line) {
   if (!strcmp(line,"STATUS")) report();
-  else if (!strcmp(line,"LOAD OFF")) { loadEnabled=false; setLoad(0); }
+  else if (!strcmp(line,"LOAD OFF")) { loadEnabled=false; targetLoadA=0.0f; setLoad(0); }
   else if (!strncmp(line,"LOAD ",5)) {
     float mA;
     if (!parseNumber(line+5,mA,0.0f,500.0f)) {
@@ -283,14 +372,14 @@ void command(char* line) {
         requested!=(int)requested) {
       Serial.println(F("# ANGLE requires integer 20..150")); return;
     }
-    angle=(int)requested; tracking=false;
+    angle=(int)requested; updateServoTarget(); tracking=false;
   }
   else if (!strcmp(line,"RESETFAULT")) {
     if (readSensors() && batV>LOAD_CUTOFF && batV<CV_TARGET &&
         chargeI<=CHARGE_LIMIT && pvI>=-0.05f) {
       lastGood=millis(); fault=false; badReadings=0; overcurrentRetryAt=0; tripCount=0; mode="OFF";
       chargeEnabled=false; loadEnabled=false; chargeTime=0;
-      buckOff(); setLoad(0);
+      targetLoadA=0.0f; buckOff(); setLoad(0);
       Serial.println(F("# fault cleared; outputs remain OFF"));
     } else Serial.println(F("# fault remains; check wiring and limits"));
   }
@@ -327,7 +416,8 @@ void report() {
 }
 
 void setup() {
-  pinMode(SERVO_PIN,OUTPUT); digitalWrite(SERVO_PIN,LOW);
+  setupServoTimer2();
+  updateServoTarget();
   setupPWM(); buckOff(); setLoad(0);
   Serial.begin(115200); Wire.begin(); Wire.setClock(100000);
 #ifdef WIRE_HAS_TIMEOUT
@@ -345,18 +435,18 @@ void setup() {
   else {
     lastGood=millis();
   }
-  lastChargeTick=millis(); servoFrame=micros();
+  lastChargeTick=millis();
   Serial.println(F("ms,pvV,pvA,pvW,batV,chargeA,loadA,targetA,buckDuty,servo,mode,fault"));
   Serial.println(F("# charge OFF at startup; use CHARGE ON to enable"));
   wdt_enable(WDTO_1S);
 }
 void loop() {
-  wdt_reset(); servoPulse(); serialInput();
+  wdt_reset(); serialInput();
   unsigned long now=millis();
   if (now-lastGood>STALE_LIMIT) {
     if (!fault) shutdown(F("stale sensor data"));
   }
-  if (!fault && now-lastSense>=SENSOR_PERIOD && quietWindow()) {
+  if (!fault && now-lastSense>=SENSOR_PERIOD) {
     lastSense=now;
     if (!readSensors()) {
       buckOff(); setLoad(0); mode="SENSOR_WAIT";
@@ -367,9 +457,9 @@ void loop() {
       controlCharger(millis());
     }
   }
-  if (!fault && now-lastLDR>=LDR_PERIOD && quietWindow()) { lastLDR=now; sampleLDR(); }
+  if (!fault && now-lastLDR>=LDR_PERIOD) { lastLDR=now; sampleLDR(); }
   if (now-lastTrack>=TRACK_PERIOD) { lastTrack=now; trackSun(now); }
-  if (now-lastReport>=TELEMETRY_PERIOD && quietWindow()) {
+  if (now-lastReport>=TELEMETRY_PERIOD) {
     lastReport=now; report();
   }
 }
